@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-import numpy as np
+import time
 
 
 # =========================
@@ -24,7 +24,7 @@ class TrainerConfig:
 
 
 # =========================
-# MLP FLEXÍVEL
+# MLP
 # =========================
 class MLP(nn.Module):
     def __init__(
@@ -39,7 +39,6 @@ class MLP(nn.Module):
 
         layers = []
         prev_dim = input_dim
-
         act_fn = self._get_activation(activation)
 
         for h in hidden_layers:
@@ -75,12 +74,13 @@ class MLP(nn.Module):
 
 
 # =========================
-# TRAINER (fit incremental)
+# TRAINER
 # =========================
 class TorchTrainer:
     def __init__(self, model, config: TrainerConfig):
-        self.model = model.to(config.device)
         self.config = config
+        self.device = config.device
+        self.model = model.to(self.device)
 
         self.optimizer = self._build_optimizer()
         self.loss_fn = self._build_loss()
@@ -102,8 +102,7 @@ class TorchTrainer:
             raise ValueError("Unknown loss")
 
     def fit(self, X, y):
-        X = torch.tensor(X, dtype=torch.float32, device=self.config.device)
-        y = torch.tensor(y, dtype=torch.float32, device=self.config.device).view(-1, 1)
+        y = y.view(-1, 1)
 
         self.model.train()
 
@@ -114,38 +113,19 @@ class TorchTrainer:
             loss.backward()
             self.optimizer.step()
 
-    # 🔥 interno (sem conversão)
-    def predict_tensor(self, X_tensor):
+    def predict(self, X_tensor):
         self.model.eval()
         with torch.no_grad():
-            preds = self.model(X_tensor)
-        return preds
-
-    # API externa
-    def predict(self, X):
-        X = torch.tensor(X, dtype=torch.float32, device=self.config.device)
-        preds = self.predict_tensor(X)
-        return preds.cpu().numpy()
-
-
-# =========================
-# BOOTSTRAP
-# =========================
-def bootstrap_sample(X, y):
-    idx = np.random.choice(len(X), size=len(X), replace=True)
-    return X[idx], y[idx]
+            return self.model(X_tensor)
 
 
 # =========================
 # MONTE CARLO
 # =========================
 def monte_carlo_sample(x, std, n_samples, device):
-    x = torch.tensor(x, dtype=torch.float32, device=device)
     x = x.unsqueeze(0).repeat(n_samples, 1)
-
-    noise = torch.randn_like(x) * std
-
-    return x + noise  # [n_samples, input_dim]
+    noise = torch.randn_like(x, device=device) * std
+    return x + noise
 
 
 # =========================
@@ -153,31 +133,28 @@ def monte_carlo_sample(x, std, n_samples, device):
 # =========================
 class InferenceEnsemble:
     def __init__(self, n_models, model_fn, trainer_config):
-        self.models = []
+        self.device = trainer_config.device
         self.trainers = []
-        self.n_models = n_models
 
         for _ in range(n_models):
             model = model_fn()
             trainer = TorchTrainer(model, trainer_config)
-
-            self.models.append(model)
             self.trainers.append(trainer)
 
     def fit(self, X, y):
+        N = X.shape[0]
+
         for trainer in self.trainers:
-            Xb, yb = bootstrap_sample(X, y)
-            trainer.fit(Xb, yb)
+            idx = torch.randint(0, N, (N,), device=self.device)
+            trainer.fit(X[idx], y[idx])
 
     def predict(self, x):
-        preds = []
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
 
-        for trainer in self.trainers:
-            x_tensor = torch.tensor([x], dtype=torch.float32, device=trainer.config.device)
-            pred = trainer.predict_tensor(x_tensor)
-            preds.append(pred.item())
+        preds = torch.stack([trainer.predict(x).squeeze(-1) for trainer in self.trainers])
 
-        return float(np.mean(preds))
+        return preds.mean(dim=0)
 
 
 # =========================
@@ -185,108 +162,143 @@ class InferenceEnsemble:
 # =========================
 class UncertaintyEnsemble:
     def __init__(self, n_models, model_fn, trainer_config):
-        self.models = []
-        self.trainers = []
+        self.device = trainer_config.device
         self.config = trainer_config
+        self.trainers = []
 
         for _ in range(n_models):
             model = model_fn()
             trainer = TorchTrainer(model, trainer_config)
-
-            self.models.append(model)
             self.trainers.append(trainer)
 
-    def fit(self, X, y, input_std):
+    def fit(self, X, y, input_std, mcs_samples=50):
+        N = X.shape[0]
+
         for trainer in self.trainers:
-            X_noisy = X + np.random.normal(0, input_std, X.shape)
-            Xb, yb = bootstrap_sample(X_noisy, y)
-            trainer.fit(Xb, yb)
+
+            X_mcs_list = []
+            y_mcs_list = []
+
+            for i in range(N):
+                x_mc = monte_carlo_sample(
+                    X[i],
+                    input_std,
+                    mcs_samples,
+                    self.device
+                )
+
+                X_mcs_list.append(x_mc)
+
+                y_i = torch.full((mcs_samples,), y[i], device=self.device)
+                y_mcs_list.append(y_i)
+
+            X_mcs = torch.cat(X_mcs_list, dim=0)
+            y_mcs = torch.cat(y_mcs_list, dim=0)
+
+            idx = torch.randint(0, X_mcs.shape[0], (N,), device=self.device)
+
+            trainer.fit(X_mcs[idx], y_mcs[idx])
 
     def predict_uncertainty(self, x, mcs_samples, input_std, u_M, k=2):
-        device = self.config.device
+        x_mc = monte_carlo_sample(x, input_std, mcs_samples, self.device)
 
-        # Monte Carlo batch (GPU)
-        x_mc = monte_carlo_sample(x, input_std, mcs_samples, device)
-
-        outputs = []
+        outputs = torch.zeros(0, device=self.device)
 
         for trainer in self.trainers:
-            preds = trainer.predict_tensor(x_mc)
-            outputs.append(preds.view(-1))
+            preds = trainer.predict(x_mc).view(-1)
+            outputs = torch.cat((outputs, preds))
 
-        outputs = torch.cat(outputs)
-
-        # estatística em torch
         u_E = torch.std(outputs, unbiased=True)
-        u_cI = torch.sqrt(torch.tensor(u_M, device=device)**2 + u_E**2)
-        U_I = k * u_cI
+        u_M_t = torch.tensor(u_M, device=self.device)
 
-        return U_I.item()
+        u_cI = torch.sqrt(u_M_t**2 + u_E**2)
+
+        return (k * u_cI).item()
 
 
 # =========================
-# EXEMPLO DE USO
+# CLASSE DE ALTO NÍVEL
 # =========================
-import time
-if __name__ == "__main__":
-
-    # Dados fictícios
-    X = np.random.rand(200, 3)
-    y = np.random.rand(200)
-
-    start_time = time.time()
-
-    # Definição do modelo
-    def model_fn():
-        return MLP(
-            input_dim=3,
-            hidden_layers=[64, 32],
-            activation="relu",
-            dropout=0
-        )
-
-    # Configuração
-    config = TrainerConfig(
-        epochs=100,
-        lr=1e-3
-    )
-
-    # =========================
-    # INFERÊNCIA
-    # =========================
-    inf_ens = InferenceEnsemble(
-        n_models=30,
-        model_fn=model_fn,
-        trainer_config=config
-    )
-    inf_ens.fit(X, y)
-
-    # =========================
-    # INCERTEZA
-    # =========================
-    unc_ens = UncertaintyEnsemble(
+class UQModel:
+    def __init__(
+        self,
+        model_fn,
+        trainer_config,
         n_models=100,
-        model_fn=model_fn,
-        trainer_config=config
-    )
-    unc_ens.fit(X, y, input_std=0.01)
-
-    # Novo ponto
-    x_new = np.array([0.5, 0.2, 0.1])
-
-    # Predição
-    y_pred = inf_ens.predict(x_new)
-
-    # Incerteza
-    U_I = unc_ens.predict_uncertainty(
-        x_new,
         mcs_samples=1000,
         input_std=0.01,
-        u_M=0.038
-    )
+        u_M=0.0,
+        k=2,
+        verbose=False
+    ):
+        self.device = trainer_config.device
+        self.config = trainer_config
 
-    end_time = time.time()
-    print(f"Tempo total: {end_time - start_time:.2f} segundos")
+        self.inf_ens = InferenceEnsemble(n_models, model_fn, trainer_config)
+        self.unc_ens = UncertaintyEnsemble(n_models, model_fn, trainer_config)
 
-    print("Predição:", y_pred)
-    print("Incerteza:", U_I)
+        self.mcs_samples = mcs_samples
+        self.input_std = input_std
+        self.u_M = u_M
+        self.k = k
+        self.verbose = verbose
+
+    def _to_tensor(self, x):
+        if torch.is_tensor(x):
+            return x.to(self.device)
+        return torch.tensor(x, dtype=torch.float32, device=self.device)
+
+    def _to_numpy(self, x):
+        if torch.is_tensor(x):
+            return x.detach().cpu().numpy()
+        return x
+
+    def fit(self, X, y):
+        X = self._to_tensor(X)
+        y = self._to_tensor(y)
+
+        start = time.time()
+
+        if self.verbose:
+            print("Treinando ensemble de inferência do valor...")
+
+        self.inf_ens.fit(X, y)
+
+        if self.verbose:
+            print("Treinando ensemble de incerteza da incerteza...")
+
+        self.unc_ens.fit(X, y, input_std=self.input_std)
+
+        if self.verbose:
+            print(f"Calibração concluída em {time.time() - start:.2f}s")
+
+    def predict(self, x, return_uncertainty=True):
+        x = self._to_tensor(x)
+
+        start = time.time()
+
+        y_pred = self.inf_ens.predict(x)
+
+        if not return_uncertainty:
+            if self.verbose:
+                print(f"Inferência em {time.time() - start:.4f}s")
+            return self._to_numpy(y_pred)
+
+        # Compute uncertainty per sample
+        U_list = []
+        for i in range(x.shape[0]):
+            U_i = self.unc_ens.predict_uncertainty(
+                x[i],
+                mcs_samples=self.mcs_samples,
+                input_std=self.input_std,
+                u_M=self.u_M,
+                k=self.k
+            )
+            U_list.append(U_i)
+
+        U_I = torch.tensor(U_list, device=self.device)
+
+        if self.verbose:
+            print(f"Inferência em {time.time() - start:.4f}s")
+
+        return self._to_numpy(y_pred), self._to_numpy(U_I)
