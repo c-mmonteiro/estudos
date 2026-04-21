@@ -1,18 +1,13 @@
 import torch
 import torch.nn as nn
-import numpy as np
+import time
 
 
 # =========================
-# CONFIGURAÇÃO
+# CONFIG
 # =========================
-class TrainerConfigParallel:
-    def __init__(
-        self,
-        epochs=200,
-        lr=1e-3,
-        device=None
-    ):
+class TrainerConfig:
+    def __init__(self, epochs=200, lr=1e-3, device=None):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Usando dispositivo: {self.device}")
         self.epochs = epochs
@@ -20,245 +15,201 @@ class TrainerConfigParallel:
 
 
 # =========================
+# CAMADA PARALELA
+# =========================
+class ParallelLinear(nn.Module):
+    def __init__(self, n_models, in_features, out_features):
+        super().__init__()
+
+        self.weight = nn.Parameter(
+            torch.randn(n_models, in_features, out_features) * 0.01
+        )
+        self.bias = nn.Parameter(
+            torch.zeros(n_models, 1, out_features)
+        )
+
+    def forward(self, x):
+        # x: [M, B, in]
+        return torch.bmm(x, self.weight) + self.bias
+
+
+# =========================
 # MLP PARALELO
 # =========================
 class ParallelMLP(nn.Module):
-    def __init__(self, n_models, input_dim, hidden_layers=[45], activation="tanh"):
+    def __init__(self, n_models, input_dim, hidden_layers=[64, 32], activation="relu"):
         super().__init__()
 
         self.n_models = n_models
-        self.activation = self._get_activation(activation)
+        self.layers = nn.ModuleList()
 
-        dims = [input_dim] + hidden_layers + [1]
+        prev = input_dim
 
-        self.weights = nn.ParameterList()
-        self.biases = nn.ParameterList()
+        for h in hidden_layers:
+            self.layers.append(ParallelLinear(n_models, prev, h))
+            prev = h
 
-        for i in range(len(dims) - 1):
-            w = nn.Parameter(torch.randn(n_models, dims[i], dims[i+1]) * 0.1)
-            b = nn.Parameter(torch.zeros(n_models, dims[i+1]))
-            self.weights.append(w)
-            self.biases.append(b)
+        self.out = ParallelLinear(n_models, prev, 1)
+
+        if activation == "relu":
+            self.act = nn.ReLU()
+        elif activation == "tanh":
+            self.act = nn.Tanh()
+        else:
+            raise ValueError("Activation not supported")
 
     def forward(self, x):
-        # x: [n_models, batch, input_dim]
+        # x: [B, d] → [M, B, d]
+        x = x.unsqueeze(0).repeat(self.n_models, 1, 1)
 
-        for i in range(len(self.weights) - 1):
-            x = torch.bmm(x, self.weights[i]) + self.biases[i].unsqueeze(1)
-            x = self.activation(x)
+        for layer in self.layers:
+            x = self.act(layer(x))
 
-        x = torch.bmm(x, self.weights[-1]) + self.biases[-1].unsqueeze(1)
+        x = self.out(x)
 
-        return x  # [n_models, batch, 1]
-
-    def _get_activation(self, name):
-        if name == "tanh":
-            return torch.tanh
-        elif name == "relu":
-            return torch.relu
-        elif name == "sigmoid":
-            return torch.sigmoid
-        else:
-            raise ValueError(f"Unknown activation: {name}")
+        return x  # [M, B, 1]
 
 
 # =========================
 # TRAINER PARALELO
 # =========================
 class ParallelTrainer:
-    def __init__(self, model, config: TrainerConfigParallel):
+    def __init__(self, model, config):
         self.model = model.to(config.device)
-        self.config = config
+        self.device = config.device
+
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.lr)
+        self.loss_fn = nn.MSELoss()
+        self.epochs = config.epochs
 
-    def fit(self, X, y, input_std=None):
-        device = self.config.device
+    def fit(self, X, y):
+        B = X.shape[0]
 
-        X = torch.tensor(X, dtype=torch.float32, device=device)
-        y = torch.tensor(y, dtype=torch.float32, device=device)
+        # expand y → [M, B, 1]
+        y = y.view(1, B, 1).repeat(self.model.n_models, 1, 1)
 
-        n_models = self.model.n_models
-        n_samples, input_dim = X.shape
-
-        for _ in range(self.config.epochs):
+        for _ in range(self.epochs):
             self.optimizer.zero_grad()
 
-            # =========================
-            # RUÍDO POR MODELO
-            # =========================
-            if input_std is not None:
-                noise = torch.randn(n_models, n_samples, input_dim, device=device) * input_std
-                X_noisy = X.unsqueeze(0) + noise
-            else:
-                X_noisy = X.unsqueeze(0).expand(n_models, -1, -1)
+            preds = self.model(X)
 
-            # =========================
-            # BOOTSTRAP POR MODELO
-            # =========================
-            idx = torch.randint(0, n_samples, (n_models, n_samples), device=device)
-
-            Xb = torch.gather(
-                X_noisy,
-                1,
-                idx.unsqueeze(-1).expand(-1, -1, input_dim)
-            )
-
-            y_expand = y.view(1, -1, 1).expand(n_models, -1, -1)
-
-            yb = torch.gather(
-                y_expand,
-                1,
-                idx.unsqueeze(-1)
-            )
-
-            # =========================
-            # FORWARD
-            # =========================
-            preds = self.model(Xb)
-
-            # =========================
-            # LOSS POR MODELO
-            # =========================
-            loss = (preds - yb) ** 2
-            loss = loss.mean(dim=1)   # por modelo
-            loss = loss.mean()        # escalar final
+            loss = self.loss_fn(preds, y)
 
             loss.backward()
             self.optimizer.step()
 
-    def predict_tensor(self, X):
+    def predict(self, X):
         with torch.no_grad():
-            preds = self.model(X)
-        return preds
+            return self.model(X)  # [M, B, 1]
 
 
 # =========================
 # MONTE CARLO
 # =========================
-def monte_carlo_sample(x, std, n_samples, device):
-    x = torch.tensor(x, dtype=torch.float32, device=device)
-    x = x.unsqueeze(0).repeat(n_samples, 1)
-    noise = torch.randn_like(x) * std
-    return x + noise  # [n_samples, input_dim]
+def monte_carlo_sample_batch(X, std, n_samples, device):
+    B, d = X.shape
+
+    X_expanded = X.unsqueeze(1).repeat(1, n_samples, 1)
+    noise = torch.randn((B, n_samples, d), device=device) * std
+
+    X_mc = X_expanded + noise
+
+    return X_mc.view(-1, d), B
 
 
 # =========================
-# ENSEMBLE - INFERÊNCIA
+# MODELO COMPLETO
 # =========================
-class InferenceEnsembleParallel:
-    def __init__(self, n_models, model_fn, trainer_config):
-        base_model = model_fn()
-
-        hidden_layers = [
-            layer.out_features
-            for layer in base_model
-            if isinstance(layer, nn.Linear)
-        ][:-1]
-
-        input_dim = base_model[0].in_features
+class UQModel_Paralelo:
+    def __init__(
+        self,
+        input_dim,
+        hidden_layers=[64, 32],
+        n_models=100,
+        trainer_config=None,
+        mcs_samples=1000,
+        input_std=0.01,
+        u_M=0.0,
+        k=2,
+        verbose=False
+    ):
+        self.device = trainer_config.device
 
         self.model = ParallelMLP(
             n_models=n_models,
             input_dim=input_dim,
-            hidden_layers=hidden_layers,
-            activation="relu"
+            hidden_layers=hidden_layers
         )
 
         self.trainer = ParallelTrainer(self.model, trainer_config)
-        self.device = trainer_config.device
+
+        self.mcs_samples = mcs_samples
+        self.input_std = input_std
+        self.u_M = u_M
+        self.k = k
+        self.verbose = verbose
+
+    def _to_tensor(self, x):
+        if torch.is_tensor(x):
+            return x.to(self.device)
+        return torch.tensor(x, dtype=torch.float32, device=self.device)
+
+    def _to_numpy(self, x):
+        return x.detach().cpu().numpy()
 
     def fit(self, X, y):
+        X = self._to_tensor(X)
+        y = self._to_tensor(y)
+
+        start = time.time()
+
         self.trainer.fit(X, y)
 
-    def predict(self, x):
-        x = torch.tensor([x], dtype=torch.float32, device=self.device)
-        x = x.unsqueeze(0).expand(self.model.n_models, -1, -1)
+        if self.verbose:
+            print(f"Treinamento concluído em {time.time() - start:.2f}s")
 
-        preds = self.trainer.predict_tensor(x)
-        return preds.mean().item()
+    def predict(self, X, return_uncertainty=True):
+        X = self._to_tensor(X)
 
+        if X.dim() == 1:
+            X = X.unsqueeze(0)
 
-# =========================
-# ENSEMBLE - INCERTEZA
-# =========================
-class UncertaintyEnsembleParallel:
-    def __init__(self, n_models, model_fn, trainer_config):
-        base_model = model_fn()
+        start = time.time()
 
-        hidden_layers = [
-            layer.out_features
-            for layer in base_model
-            if isinstance(layer, nn.Linear)
-        ][:-1]
+        preds = self.trainer.predict(X)  # [M, B, 1]
 
-        input_dim = base_model[0].in_features
+        mean = preds.mean(dim=0).squeeze()
 
-        self.model = ParallelMLP(
-            n_models=n_models,
-            input_dim=input_dim,
-            hidden_layers=hidden_layers,
-            activation="relu"
+        if not return_uncertainty:
+            return self._to_numpy(mean)
+
+        # MCS
+        X_mc, B = monte_carlo_sample_batch(
+            X,
+            self.input_std,
+            self.mcs_samples,
+            self.device
         )
 
-        self.trainer = ParallelTrainer(self.model, trainer_config)
-        self.device = trainer_config.device
+        preds_mc = self.trainer.predict(X_mc)  # [M, B*mcs, 1]
 
-    def fit(self, X, y, input_std):
-        self.trainer.fit(X, y, input_std=input_std)
-
-    def predict_uncertainty(self, x, mcs_samples, input_std, u_M, k=2):
-        x_mc = monte_carlo_sample(x, input_std, mcs_samples, self.device)
-
-        # expandir para todos modelos
-        x_mc = x_mc.unsqueeze(0).expand(self.model.n_models, -1, -1)
-
-        preds = self.trainer.predict_tensor(x_mc)  # [n_models, mcs, 1]
-        preds = preds.reshape(-1)
-
-        u_E = torch.std(preds, unbiased=True)
-        u_cI = torch.sqrt(torch.tensor(u_M, device=self.device)**2 + u_E**2)
-
-        return (k * u_cI).item()
-
-
-# =========================
-# EXEMPLO DE USO
-# =========================
-import time
-if __name__ == "__main__":
-
-    X = np.random.rand(200, 3)
-    y = np.random.rand(200)
-    
-    start_time = time.time()
-
-    def model_fn():
-        return nn.Sequential(
-            nn.Linear(3, 64),
-            nn.ReLU(),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1)
+        preds_mc = preds_mc.view(
+            self.model.n_models,
+            B,
+            self.mcs_samples
         )
 
-    config = TrainerConfigParallel(epochs=100, lr=1e-3)
+        preds_mc = preds_mc.reshape(-1, B)
 
-    # Inferência
-    inf = InferenceEnsembleParallel(30, model_fn, config)
-    inf.fit(X, y)
+        u_E = torch.std(preds_mc, dim=0)
 
-    # Incerteza
-    unc = UncertaintyEnsembleParallel(100, model_fn, config)
-    unc.fit(X, y, input_std=0.01)
+        u_M_t = torch.tensor(self.u_M, device=self.device)
 
-    x_new = np.array([0.5, 0.2, 0.1])
+        u_cI = torch.sqrt(u_M_t**2 + u_E**2)
 
-    y_pred = inf.predict(x_new)
+        U = self.k * u_cI
 
-    U_I = unc.predict_uncertainty(x_new, 1000, 0.01, 0.038)
+        if self.verbose:
+            print(f"Inferência em {time.time() - start:.4f}s")
 
-    end_time = time.time()
-    print(f"Tempo total: {end_time - start_time:.2f} segundos")
-
-    print("Pred:", y_pred)
-    print("Unc:", U_I)
+        return self._to_numpy(mean), self._to_numpy(U)
