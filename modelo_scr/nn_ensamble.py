@@ -158,15 +158,6 @@ class TorchTrainer:
 
 
 # =========================
-# MONTE CARLO
-# =========================
-def monte_carlo_sample(x, std, n_samples, device):
-    x = x.unsqueeze(0).repeat(n_samples, 1)
-    noise = torch.randn_like(x, device=device) * std
-    return x + noise
-
-
-# =========================
 # ENSEMBLE - INFERÊNCIA
 # =========================
 class InferenceEnsemble:
@@ -195,73 +186,7 @@ class InferenceEnsemble:
             for trainer in self.trainers
         ])
 
-        return preds.mean(dim=0)
-
-    def get_state(self):
-        return [trainer.get_state() for trainer in self.trainers]
-
-    def load_state(self, states):
-        for trainer, state in zip(self.trainers, states):
-            trainer.load_state(state)
-
-
-# =========================
-# ENSEMBLE - INCERTEZA
-# =========================
-class UncertaintyEnsemble:
-    def __init__(self, n_models, model_fn, trainer_config):
-        self.device = trainer_config.device
-        self.config = trainer_config
-        self.trainers = []
-
-        for _ in range(n_models):
-            model = model_fn()
-            trainer = TorchTrainer(model, trainer_config)
-            self.trainers.append(trainer)
-
-    def fit(self, X, y, input_std, mcs_samples=50):
-        N = X.shape[0]
-
-        for trainer in self.trainers:
-
-            X_mcs_list = []
-            y_mcs_list = []
-
-            for i in range(N):
-                x_mc = monte_carlo_sample(
-                    X[i],
-                    input_std,
-                    mcs_samples,
-                    self.device
-                )
-
-                X_mcs_list.append(x_mc)
-
-                y_i = torch.full((mcs_samples,), y[i], device=self.device)
-                y_mcs_list.append(y_i)
-
-            X_mcs = torch.cat(X_mcs_list, dim=0)
-            y_mcs = torch.cat(y_mcs_list, dim=0)
-
-            idx = torch.randint(0, X_mcs.shape[0], (N,), device=self.device)
-
-            trainer.fit(X_mcs[idx], y_mcs[idx])
-
-    def predict_uncertainty(self, x, mcs_samples, input_std, u_M, k=2):
-        x_mc = monte_carlo_sample(x, input_std, mcs_samples, self.device)
-
-        outputs = torch.zeros(0, device=self.device)
-
-        for trainer in self.trainers:
-            preds = trainer.predict(x_mc).view(-1)
-            outputs = torch.cat((outputs, preds))
-
-        u_E = torch.std(outputs, unbiased=True)
-        u_M_t = torch.tensor(u_M, device=self.device)
-
-        u_cI = torch.sqrt(u_M_t**2 + u_E**2)
-
-        return (k * u_cI).item()
+        return preds.mean(dim=0), preds.std(dim=0)
 
     def get_state(self):
         return [trainer.get_state() for trainer in self.trainers]
@@ -274,28 +199,19 @@ class UncertaintyEnsemble:
 # =========================
 # CLASSE DE ALTO NÍVEL
 # =========================
-class UQModel:
+class NNEnsambleModel:
     def __init__(
         self,
         model_fn,
         trainer_config,
         n_models=100,
-        mcs_samples=1000,
-        input_std=0.01,
-        u_M=0.0,
-        k=2,
         verbose=False
     ):
         self.device = trainer_config.device
         self.config = trainer_config
 
         self.inf_ens = InferenceEnsemble(n_models, model_fn, trainer_config)
-        self.unc_ens = UncertaintyEnsemble(n_models, model_fn, trainer_config)
 
-        self.mcs_samples = mcs_samples
-        self.input_std = input_std
-        self.u_M = u_M
-        self.k = k
         self.verbose = verbose
 
     def _to_tensor(self, x):
@@ -320,49 +236,28 @@ class UQModel:
         self.inf_ens.fit(X, y)
 
         if self.verbose:
-            print("Treinando ensemble de incerteza...")
-
-        self.unc_ens.fit(X, y, input_std=self.input_std)
-
-        if self.verbose:
             print(f"Treinamento concluído em {time.time() - start:.2f}s")
 
-    def predict(self, x, return_uncertainty=True, in_tensor=False):
+    def predict(self, x, return_std=True, in_tensor=False):
         x = self._to_tensor(x)
 
         start = time.time()
 
-        y_pred = self.inf_ens.predict(x)
-
-        if not return_uncertainty:
-            if self.verbose:
-                print(f"Inferência em {time.time() - start:.4f}s")
-            if in_tensor:
-                return y_pred
-            else:
-                return self._to_numpy(y_pred)
-
-        # Compute uncertainty per sample
-        U_list = []
-        for i in range(x.shape[0]):
-            U_i = self.unc_ens.predict_uncertainty(
-                x[i],
-                mcs_samples=self.mcs_samples,
-                input_std=self.input_std,
-                u_M=self.u_M,
-                k=self.k
-            )
-            U_list.append(U_i)
-
-        U_I = torch.tensor(U_list, device=self.device)
+        y_pred, std_pred = self.inf_ens.predict(x)
 
         if self.verbose:
             print(f"Inferência em {time.time() - start:.4f}s")
 
-        if in_tensor:
-            return y_pred, U_I
+        if not return_std:
+            if in_tensor:
+                return y_pred
+            else:
+                return self._to_numpy(y_pred)
         else:
-            return self._to_numpy(y_pred), self._to_numpy(U_I)
+            if in_tensor:
+                return y_pred, std_pred
+            else:
+                return self._to_numpy(y_pred), self._to_numpy(std_pred)
 
     # =========================
     # SAVE / LOAD
@@ -374,14 +269,9 @@ class UQModel:
             "model_config": model_config,
             "trainer_config": self.config.to_dict(),
             "uq_params": {
-                "n_models": len(self.inf_ens.trainers),
-                "mcs_samples": self.mcs_samples,
-                "input_std": self.input_std,
-                "u_M": self.u_M,
-                "k": self.k
+                "n_models": len(self.inf_ens.trainers)
             },
-            "inf_ens": self.inf_ens.get_state(),
-            "unc_ens": self.unc_ens.get_state()
+            "inf_ens": self.inf_ens.get_state()
         }
 
         torch.save(state, path)
@@ -408,14 +298,9 @@ class UQModel:
         uq_model = cls(
             model_fn=model_fn,
             trainer_config=trainer_config,
-            n_models=uq_params["n_models"],
-            mcs_samples=uq_params["mcs_samples"],
-            input_std=uq_params["input_std"],
-            u_M=uq_params["u_M"],
-            k=uq_params["k"]
+            n_models=uq_params["n_models"]
         )
 
         uq_model.inf_ens.load_state(checkpoint["inf_ens"])
-        uq_model.unc_ens.load_state(checkpoint["unc_ens"])
 
         return uq_model

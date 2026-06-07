@@ -53,3 +53,7 @@ dkms.conf
 
 # debug information files
 *.dwo
+*.pyc
+
+# Model artifacts
+*.pt
