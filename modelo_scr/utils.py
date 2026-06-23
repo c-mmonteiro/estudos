@@ -255,31 +255,16 @@ class UncertaintyEvaluator:
         X_mc = X_mc + X_mc * erro_aleatorio * eps #- X_mc*erro_sistematico
 
         # Inferencia
-        y_pred = model.predict(X_mc)
+        y_pred = model.predict_sample(X_mc)
 
-        if isinstance(y_pred, tuple):  # ex.: (mean, std)
-            y_np, y_pred_std = y_pred[0], y_pred[1]
-            y_pred_std = np.asarray(y_pred_std, dtype=np.float32).reshape(n_amostras, n_simulacoes)
-        else:
-            y_np = y_pred
-            y_pred_std = None
 
-        y_mc = np.asarray(y_np, dtype=np.float32).reshape(n_amostras, n_simulacoes)
-
+        y_mc = np.asarray(y_pred, dtype=np.float32).reshape(model.n_models_ensemble, n_amostras, n_simulacoes)
+        y_mc = y_mc.transpose(1, 2, 0) # Transposição para (n_amostras, n_simulacoes, n_models_ensemble)
+        y_mc = y_mc.reshape(n_amostras, n_simulacoes * model.n_models_ensemble) # Reshape para (n_amostras, n_simulacoes * n_models_ensemble)
+          
         y_low = np.quantile(y_mc, quantis[0], axis=1)
         y_high = np.quantile(y_mc, quantis[1], axis=1)
         y_mean = y_mc.mean(axis=1)
-
-    #    if y_pred_std is not None:
-    #        y_std_mc = y_mc.std(axis=1)
-    #        y_pred_std_mean = y_pred_std.mean(axis=1)
-    #        
-    #        y_std_c = 2*np.sqrt(np.square(y_pred_std_mean) + np.square(y_std_mc))
-    #        return {
-    #            "y_pred_mean": y_mean,
-    #            "y_pred_low": y_mean - y_std_c,
-    #            "y_pred_high": y_mean + y_std_c,
-    #        }
 
         return y_mean, y_low, y_high
 

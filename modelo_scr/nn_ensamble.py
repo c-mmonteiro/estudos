@@ -204,6 +204,17 @@ class InferenceEnsemble:
         q_values = torch.quantile(preds, quantiles, dim=0)
 
         return mean_pred, q_values
+    
+    def predict_sample(self, x):
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+
+        preds = torch.stack([
+            trainer.predict(x).squeeze(-1)
+            for trainer in self.trainers
+        ])
+
+        return preds
 
     def get_state(self):
         return [trainer.get_state() for trainer in self.trainers]
@@ -230,6 +241,8 @@ class NNEnsambleModel:
         self.inf_ens = InferenceEnsemble(n_models, model_fn, trainer_config)
 
         self.verbose = verbose
+
+        self.n_models_ensemble = n_models
 
     def _to_tensor(self, x):
         if torch.is_tensor(x):
@@ -289,6 +302,19 @@ class NNEnsambleModel:
             print(f"Inferência em {time.time() - start:.4f}s")
 
         return self._to_numpy(y_pred), self._to_numpy(q_values)
+
+    def predict_sample(self, x):
+        x = self._to_tensor(x)
+
+        start = time.time()
+
+        y_pred = self.inf_ens.predict_sample(x)
+
+        if self.verbose:
+            print(f"Inferência em {time.time() - start:.4f}s")
+
+        
+        return self._to_numpy(y_pred)
 
     # =========================
     # SAVE / LOAD
