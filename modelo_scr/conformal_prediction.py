@@ -169,8 +169,12 @@ class ConformalRegressor:
     def __init__(
         self,
         model,
+        X_calib,
+        y_calib,
+        score_function="absolute",
         alpha=0.1,
-        eps=1e-8
+        eps=1e-8,
+        verbose=True
     ):
 
         # ----------------------------------------------------
@@ -190,19 +194,12 @@ class ConformalRegressor:
         # ----------------------------------------------------
 
         self.model = model
-
         self.alpha = alpha
-
         self.eps = eps
-
         self.qhat = None
-
         self.score_function = None
-
         self.score_name = None
-
         self.calibration_scores = None
-
         self.is_calibrated = False
 
         # ----------------------------------------------------
@@ -212,6 +209,19 @@ class ConformalRegressor:
         self.X_calib = None
 
         self.y_calib = None
+
+        if X_calib is not None and y_calib is not None:
+
+            self.calibrate(
+                X_calib=X_calib,
+                y_calib=y_calib,
+                score_function=score_function
+            )
+        else:
+            print(
+                "ConformalRegressor initialized "
+                "without calibration data."
+            )
 
     # ========================================================
     # INTERNAL PREDICTION PARSER
@@ -688,3 +698,34 @@ class ConformalRegressor:
                 self.score_name
             ]
         )
+
+
+class CPCalibration:
+    def __init__(self, model, dataset_calib, mc=True, alpha=0.05):
+        self.model = model
+        self.dataset_calib = dataset_calib
+        self.mc = mc
+        self.alpha = alpha
+
+        if self.mc:
+            self.cp_dict =  {"absolute": ConformalRegressor(self.model,
+                                    X_calib=dataset_calib.X_measured_mc.reshape(-1, 1).detach().cpu().numpy(),
+                                    y_calib=dataset_calib.y_measured_mc.detach().cpu().numpy(),
+                                    score_function="absolute",
+                                    alpha=alpha),
+                            "normalized": ConformalRegressor(self.model,
+                                    X_calib=dataset_calib.X_measured_mc.reshape(-1, 1).detach().cpu().numpy(),
+                                    y_calib=dataset_calib.y_measured_mc.detach().cpu().numpy(),
+                                    score_function="normalized",
+                                    alpha=alpha)}
+        else:
+            self.cp_dict =  {"absolute": ConformalRegressor(self.model,
+                                    X_calib=dataset_calib.X_measured.reshape(-1, 1).detach().cpu().numpy(),
+                                    y_calib=dataset_calib.y_measured.detach().cpu().numpy(),
+                                    score_function="absolute",
+                                    alpha=alpha),
+                            "normalized": ConformalRegressor(self.model,
+                                    X_calib=dataset_calib.X_measured.reshape(-1, 1).detach().cpu().numpy(),
+                                    y_calib=dataset_calib.y_measured.detach().cpu().numpy(),
+                                    score_function="normalized",
+                                    alpha=alpha)}

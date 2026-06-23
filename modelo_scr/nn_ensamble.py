@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import time
-
+import tqdm
 
 # =========================
 # CONFIGURAÇÃO
@@ -170,11 +170,14 @@ class InferenceEnsemble:
             trainer = TorchTrainer(model, trainer_config)
             self.trainers.append(trainer)
 
-    def fit(self, X, y):
+    def fit(self, X, y, ds_size=None):
         N = X.shape[0]
 
-        for trainer in self.trainers:
-            idx = torch.randint(0, N, (N,), device=self.device)
+        if ds_size is None:
+            ds_size = N
+
+        for trainer in tqdm.tqdm(self.trainers):
+            idx = torch.randint(0, N, (ds_size,), device=self.device)
             trainer.fit(X[idx], y[idx])
 
     def predict(self, x):
@@ -187,6 +190,20 @@ class InferenceEnsemble:
         ])
 
         return preds.mean(dim=0), preds.std(dim=0)
+    
+    def predict_quantiles(self, x, quantiles=[0.05, 0.95]):
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+
+        preds = torch.stack([
+            trainer.predict(x).squeeze(-1)
+            for trainer in self.trainers
+        ])
+
+        mean_pred = preds.mean(dim=0)
+        q_values = torch.quantile(preds, quantiles, dim=0)
+
+        return mean_pred, q_values
 
     def get_state(self):
         return [trainer.get_state() for trainer in self.trainers]
@@ -224,7 +241,7 @@ class NNEnsambleModel:
             return x.detach().cpu().numpy()
         return x
 
-    def fit(self, X, y):
+    def fit(self, X, y, ds_size=None):
         X = self._to_tensor(X)
         y = self._to_tensor(y)
 
@@ -233,7 +250,7 @@ class NNEnsambleModel:
         if self.verbose:
             print("Treinando ensemble de inferência do valor...")
 
-        self.inf_ens.fit(X, y)
+        self.inf_ens.fit(X, y, ds_size=ds_size)
 
         if self.verbose:
             print(f"Treinamento concluído em {time.time() - start:.2f}s")
@@ -258,6 +275,20 @@ class NNEnsambleModel:
                 return y_pred, std_pred
             else:
                 return self._to_numpy(y_pred), self._to_numpy(std_pred)
+
+    def predict_quantiles(self, x, alpha=0.05):
+        x = self._to_tensor(x)
+        quantiles=[alpha/2, 1 - alpha/2]
+        quantiles = self._to_tensor(quantiles)
+
+        start = time.time()
+
+        y_pred, q_values = self.inf_ens.predict_quantiles(x, quantiles)
+
+        if self.verbose:
+            print(f"Inferência em {time.time() - start:.4f}s")
+
+        return self._to_numpy(y_pred), self._to_numpy(q_values)
 
     # =========================
     # SAVE / LOAD

@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import time
 
+import tqdm
+
 
 # =========================
 # CONFIGURAÇÃO
@@ -182,7 +184,7 @@ class InferenceEnsemble:
     def fit(self, X, y):
         N = X.shape[0]
 
-        for trainer in self.trainers:
+        for trainer in tqdm.tqdm(self.trainers):
             idx = torch.randint(0, N, (N,), device=self.device)
             trainer.fit(X[idx], y[idx])
 
@@ -222,7 +224,7 @@ class UncertaintyEnsemble:
     def fit(self, X, y, input_std, mcs_samples=50):
         N = X.shape[0]
 
-        for trainer in self.trainers:
+        for trainer in tqdm.tqdm(self.trainers):
 
             X_mcs_list = []
             y_mcs_list = []
@@ -363,6 +365,18 @@ class UQModel:
             return y_pred, U_I
         else:
             return self._to_numpy(y_pred), self._to_numpy(U_I)
+
+    def predict_quantiles(self, X, alpha=0.05):
+        X = self._to_tensor(X)
+        
+        start = time.time()
+
+        y_pred, u_i = self.predict(X, return_uncertainty=True)
+
+        if self.verbose:
+            print(f"Inferência em {time.time() - start:.4f}s")
+
+        return self._to_numpy(y_pred), self._to_numpy(y_pred - u_i), self._to_numpy(y_pred + u_i)
 
     # =========================
     # SAVE / LOAD
