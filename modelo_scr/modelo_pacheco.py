@@ -376,7 +376,7 @@ class UQModel:
         if self.verbose:
             print(f"Inferência em {time.time() - start:.4f}s")
 
-        return self._to_numpy(y_pred), self._to_numpy(y_pred - u_i), self._to_numpy(y_pred + u_i)
+        return self._to_numpy(y_pred), [self._to_numpy(y_pred - u_i), self._to_numpy(y_pred + u_i)]
 
     # =========================
     # SAVE / LOAD

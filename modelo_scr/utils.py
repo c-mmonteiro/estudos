@@ -167,7 +167,8 @@ class Dataset:
 ##################################################################           
 
 class UncertaintyEvaluator:
-    def __init__(self, model, cp_model_dict, test_dataset, alpha=0.05, num_mc_simulations=1000, verbose=True):
+    def __init__(self, model, cp_model_dict, test_dataset, 
+                 alpha=0.05, num_mc_simulations=1000, verbose=True):
         self.model = model
         self.cp_model_dict = cp_model_dict
         self.test_dataset = test_dataset
@@ -335,3 +336,41 @@ class UncertaintyEvaluator:
             yaxis_title='Y'
         )
         fig.show()
+
+
+
+
+class ModelUncertaintyEvaluator(UncertaintyEvaluator):
+    def __init__(self, model,  
+                 test_dataset, alpha=0.05, 
+                 verbose=True):
+        self.model = model
+        self.test_dataset = test_dataset
+        self.alpha = alpha
+        self.verbose = verbose
+
+        self.y_pred = {}
+        self.lower_quantiles = {}
+        self.upper_quantiles = {}
+
+        #Model Baseline
+        y_pred_model, quantiles = self.model.predict_quantiles(self.test_dataset.X_measured.reshape(-1, 1).numpy(), 
+                                                   alpha=self.alpha)
+        self.y_pred["model"] = y_pred_model
+        self.lower_quantiles["model"] = quantiles[0]
+        self.upper_quantiles["model"] = quantiles[1]
+
+
+        #Avaliação das métricas de incerteza
+        self.coverage = {}
+        self.avg_width = {}
+        if self.verbose:
+            print(f'Model       |   Coverage   |   Average Width')
+            print(f'-'*50)
+
+        for name, y_pred in self.y_pred.items():
+            self.coverage[name], self.avg_width[name] = self.uncertainty_metrics(self.lower_quantiles[name], 
+                                                                                 self.upper_quantiles[name], 
+                                                                                 self.test_dataset.y_true)
+            if self.verbose:
+                print(f"{name.ljust(12)}|{100*self.coverage[name]:13.4f}%|{self.avg_width[name]:14.4f}")
