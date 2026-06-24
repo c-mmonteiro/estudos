@@ -285,6 +285,7 @@ class UQModel:
         mcs_samples=1000,
         input_std=0.01,
         u_M=0.0,
+        u_M_abs=True,
         k=2,
         verbose=False
     ):
@@ -297,6 +298,7 @@ class UQModel:
         self.mcs_samples = mcs_samples
         self.input_std = input_std
         self.u_M = u_M
+        self.u_M_abs = u_M_abs
         self.k = k
         self.verbose = verbose
 
@@ -324,7 +326,8 @@ class UQModel:
         if self.verbose:
             print("Treinando ensemble de incerteza...")
 
-        self.unc_ens.fit(X, y, input_std=self.input_std)
+        self.unc_ens.fit(X, y, input_std=self.input_std, mcs_samples=self.mcs_samples)
+
 
         if self.verbose:
             print(f"Treinamento concluído em {time.time() - start:.2f}s")
@@ -347,11 +350,15 @@ class UQModel:
         # Compute uncertainty per sample
         U_list = []
         for i in range(x.shape[0]):
+            if self.u_M_abs:
+                u_M_sample = self.u_M
+            else:
+                u_M_sample = abs(y_pred[i].item()) * self.u_M
             U_i = self.unc_ens.predict_uncertainty(
                 x[i],
                 mcs_samples=self.mcs_samples,
                 input_std=self.input_std,
-                u_M=self.u_M,
+                u_M=u_M_sample,
                 k=self.k
             )
             U_list.append(U_i)
