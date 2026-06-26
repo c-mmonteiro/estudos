@@ -9,9 +9,9 @@ class RFEnsambleModel:
                                            verbose=True)
 
         if isinstance(X_train, np.ndarray):
-            X_train_np = X_train.reshape(-1, 1)
+            X_train_np = X_train
         else:
-            X_train_np = X_train.reshape(-1, 1).numpy()
+            X_train_np = X_train.numpy()
 
         if isinstance(y_train, np.ndarray):
             y_train_np = y_train
