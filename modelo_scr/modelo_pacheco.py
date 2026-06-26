@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 import time
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler
 
 import tqdm
 
@@ -301,6 +303,8 @@ class UQModel:
         self.u_M_abs = u_M_abs
         self.k = k
         self.verbose = verbose
+        self.x_scaler = MinMaxScaler()
+        self.y_scaler = MinMaxScaler()
 
     def _to_tensor(self, x):
         if torch.is_tensor(x):
@@ -313,10 +317,18 @@ class UQModel:
         return x
 
     def fit(self, X, y):
-        X = self._to_tensor(X)
-        y = self._to_tensor(y)
+        X_np = self._to_numpy(X)
+        y_np = self._to_numpy(y).reshape(-1, 1)
+
+        X_scaled = self.x_scaler.fit_transform(X_np)
+        y_scaled = self.y_scaler.fit_transform(y_np).reshape(-1)
+
+        X = self._to_tensor(X_scaled)
+        y = self._to_tensor(y_scaled)
 
         start = time.time()
+
+        
 
         if self.verbose:
             print("Treinando ensemble de inferência do valor...")
@@ -333,13 +345,16 @@ class UQModel:
             print(f"Treinamento concluído em {time.time() - start:.2f}s")
 
     def predict(self, x, return_uncertainty=True, in_tensor=False):
-        x = self._to_tensor(x)
+        x_np = self._to_numpy(x)
+        x = self._to_tensor(self.x_scaler.transform(x_np))
 
         start = time.time()
 
         y_pred = self.inf_ens.predict(x)
 
         if not return_uncertainty:
+            y_pred_np = self._to_numpy(y_pred).reshape(-1, 1)
+            y_pred = self._to_tensor(self.y_scaler.inverse_transform(y_pred_np).reshape(-1)) 
             if self.verbose:
                 print(f"Inferência em {time.time() - start:.4f}s")
             if in_tensor:
@@ -354,6 +369,7 @@ class UQModel:
                 u_M_sample = self.u_M
             else:
                 u_M_sample = abs(y_pred[i].item()) * self.u_M
+
             U_i = self.unc_ens.predict_uncertainty(
                 x[i],
                 mcs_samples=self.mcs_samples,
@@ -363,15 +379,22 @@ class UQModel:
             )
             U_list.append(U_i)
 
-        U_I = torch.tensor(U_list, device=self.device)
+        U_I_np = np.asarray(U_list, dtype=np.float32).reshape(-1)
+
+        # volta para a escala original do y
+        y_pred_np = self._to_numpy(y_pred).reshape(-1, 1)
+        y_pred_np = self.y_scaler.inverse_transform(y_pred_np).reshape(-1)
+        
+
+        U_I_np = U_I_np / self.y_scaler.scale_[0]  # Ajusta a incerteza para a escala original do y
 
         if self.verbose:
             print(f"Inferência em {time.time() - start:.4f}s")
 
         if in_tensor:
-            return y_pred, U_I
+            return self._to_tensor(y_pred_np), torch.tensor(U_I_np, device=self.device)
         else:
-            return self._to_numpy(y_pred), self._to_numpy(U_I)
+            return y_pred_np, U_I_np
 
     def predict_quantiles(self, X, alpha=0.05):
         X = self._to_tensor(X)
@@ -402,7 +425,11 @@ class UQModel:
                 "k": self.k
             },
             "inf_ens": self.inf_ens.get_state(),
-            "unc_ens": self.unc_ens.get_state()
+            "unc_ens": self.unc_ens.get_state(),
+            "scalers": {
+                "x_scaler": self.x_scaler,
+                "y_scaler": self.y_scaler
+            }
         }
 
         torch.save(state, path)
@@ -412,7 +439,7 @@ class UQModel:
 
     @classmethod
     def load(cls, path, device=None):
-        checkpoint = torch.load(path, map_location=device)
+        checkpoint = torch.load(path, map_location=device, weights_only=False)
 
         trainer_config = TrainerConfig.from_dict(checkpoint["trainer_config"])
 
@@ -438,5 +465,10 @@ class UQModel:
 
         uq_model.inf_ens.load_state(checkpoint["inf_ens"])
         uq_model.unc_ens.load_state(checkpoint["unc_ens"])
+
+        scalers = checkpoint.get("scalers")
+        if scalers is not None:
+            uq_model.x_scaler = scalers.get("x_scaler", uq_model.x_scaler)
+            uq_model.y_scaler = scalers.get("y_scaler", uq_model.y_scaler)
 
         return uq_model

@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import time
 import tqdm
+from sklearn.preprocessing import MinMaxScaler
 
 # =========================
 # CONFIGURAÇÃO
@@ -240,6 +241,8 @@ class NNEnsambleModel:
 
         self.inf_ens = InferenceEnsemble(n_models, model_fn, trainer_config)
 
+        self.x_scaler = MinMaxScaler()
+        self.y_scaler = MinMaxScaler()
         self.verbose = verbose
 
         self.n_models_ensemble = n_models
@@ -255,8 +258,17 @@ class NNEnsambleModel:
         return x
 
     def fit(self, X, y, ds_size=None):
-        X = self._to_tensor(X)
-        y = self._to_tensor(y)
+        X_np = self._to_numpy(X)
+        y_np = self._to_numpy(y)
+
+        if y_np.ndim == 1:
+            y_np = y_np.reshape(-1, 1)
+
+        X_scaled = self.x_scaler.fit_transform(X_np)
+        y_scaled = self.y_scaler.fit_transform(y_np).reshape(-1)
+
+        X = self._to_tensor(X_scaled)
+        y = self._to_tensor(y_scaled)
 
         start = time.time()
 
@@ -271,26 +283,38 @@ class NNEnsambleModel:
     def predict(self, x, return_std=True, in_tensor=False):
         x = self._to_tensor(x)
 
+        x_np = self._to_numpy(x)
+        x = self._to_tensor(self.x_scaler.transform(x_np))
+
         start = time.time()
 
         y_pred, std_pred = self.inf_ens.predict(x)
+
+
+        y_pred_np = self._to_numpy(y_pred).reshape(-1, 1)
+        y_pred_np = self.y_scaler.inverse_transform(y_pred_np).reshape(-1)
+
+        std_pred_np = self._to_numpy(std_pred).reshape(-1, 1)
+        std_pred_np = std_pred_np * self.y_scaler.scale_[0]  # Ajusta a incerteza para a escala original do y
 
         if self.verbose:
             print(f"Inferência em {time.time() - start:.4f}s")
 
         if not return_std:
             if in_tensor:
-                return y_pred
+                return self._to_tensor(y_pred_np)
             else:
                 return self._to_numpy(y_pred)
         else:
             if in_tensor:
-                return y_pred, std_pred
+                return self._to_tensor(y_pred_np), self._to_tensor(std_pred_np)
             else:
-                return self._to_numpy(y_pred), self._to_numpy(std_pred)
+                return y_pred_np, std_pred_np
 
     def predict_quantiles(self, x, alpha=0.05):
-        x = self._to_tensor(x)
+        x_np = self._to_numpy(x)
+        x = self._to_tensor(self.x_scaler.transform(x_np))
+
         quantiles=[alpha/2, 1 - alpha/2]
         quantiles = self._to_tensor(quantiles)
 
@@ -298,23 +322,38 @@ class NNEnsambleModel:
 
         y_pred, q_values = self.inf_ens.predict_quantiles(x, quantiles)
 
+
+        y_pred_np = self._to_numpy(y_pred).reshape(-1, 1)
+        y_pred_np = self.y_scaler.inverse_transform(y_pred_np).reshape(-1)
+
+        q_np = self._to_numpy(q_values)
+        q_shape = q_np.shape
+        q_values = self.y_scaler.scale_[0] * q_np.reshape(-1, 1)
+        q_values = q_values.reshape(q_shape)
+
+
         if self.verbose:
             print(f"Inferência em {time.time() - start:.4f}s")
 
-        return self._to_numpy(y_pred), self._to_numpy(q_values)
+        return y_pred_np, q_values
 
     def predict_sample(self, x):
-        x = self._to_tensor(x)
+        x_np = self._to_numpy(x)
+        x = self._to_tensor(self.x_scaler.transform(x_np))
 
         start = time.time()
 
         y_pred = self.inf_ens.predict_sample(x)
 
+        y_np = self._to_numpy(y_pred)
+        y_shape = y_np.shape
+        y_pred = self.y_scaler.inverse_transform(y_np.reshape(-1, 1)).reshape(y_shape)
+
         if self.verbose:
             print(f"Inferência em {time.time() - start:.4f}s")
 
         
-        return self._to_numpy(y_pred)
+        return y_pred
 
     # =========================
     # SAVE / LOAD
@@ -328,7 +367,11 @@ class NNEnsambleModel:
             "uq_params": {
                 "n_models": len(self.inf_ens.trainers)
             },
-            "inf_ens": self.inf_ens.get_state()
+            "inf_ens": self.inf_ens.get_state(),
+            "scalers": {
+                "x_scaler": self.x_scaler,
+                "y_scaler": self.y_scaler
+            }
         }
 
         torch.save(state, path)
@@ -338,7 +381,7 @@ class NNEnsambleModel:
 
     @classmethod
     def load(cls, path, device=None):
-        checkpoint = torch.load(path, map_location=device)
+        checkpoint = torch.load(path, map_location=device, weights_only=False)
 
         trainer_config = TrainerConfig.from_dict(checkpoint["trainer_config"])
 
@@ -357,6 +400,11 @@ class NNEnsambleModel:
             trainer_config=trainer_config,
             n_models=uq_params["n_models"]
         )
+
+        scalers = checkpoint.get("scalers")
+        if scalers is not None:
+            uq_model.x_scaler = scalers.get("x_scaler", uq_model.x_scaler)
+            uq_model.y_scaler = scalers.get("y_scaler", uq_model.y_scaler)
 
         uq_model.inf_ens.load_state(checkpoint["inf_ens"])
 

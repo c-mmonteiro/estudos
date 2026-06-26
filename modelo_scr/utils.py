@@ -1,7 +1,6 @@
 import torch
 import numpy as np
 import plotly.graph_objects as go
-from modelo_scr.modelo_pacheco import *
 
 
 class Dataset:
@@ -28,6 +27,10 @@ class Dataset:
             rand_error = self.X_true*self.erro_aleatorio_x*(torch.rand_like(self.X_true)*2 - 1)
         elif dist_erro_x == "normal":
             rand_error = self.X_true*self.erro_aleatorio_x*torch.randn_like(self.X_true)
+        elif dist_erro_x == "uniforme_absoluto":
+            rand_error = self.erro_aleatorio_x*(torch.rand_like(self.X_true)*2 - 1)
+        elif dist_erro_x == "normal_absoluto":
+            rand_error = self.erro_aleatorio_x*torch.randn_like(self.X_true)
         else:
             raise ValueError("dist_erro_x deve ser 'uniforme' ou 'normal'")
         
@@ -44,6 +47,10 @@ class Dataset:
             rand_error = self.y_true*self.erro_aleatorio_y*(torch.rand_like(self.y_true)*2 - 1)
         elif dist_erro_y == "normal":
             rand_error = self.y_true*self.erro_aleatorio_y*torch.randn_like(self.y_true)
+        elif dist_erro_y == "uniforme_absoluto":
+            rand_error = self.erro_aleatorio_y*(torch.rand_like(self.y_true)*2 - 1)
+        elif dist_erro_y == "normal_absoluto":
+            rand_error = self.erro_aleatorio_y*torch.randn_like(self.y_true)
         else:
             raise ValueError("dist_erro_y deve ser 'uniforme' ou 'normal'")
         
@@ -62,6 +69,10 @@ class Dataset:
             X_noise = self.X_measured_mc*self.erro_aleatorio_x*(torch.rand_like(self.X_measured_mc)*2 - 1)
         elif self.dist_erro_x == "normal":
             X_noise = self.X_measured_mc*self.erro_aleatorio_x*torch.randn_like(self.X_measured_mc)
+        elif self.dist_erro_x == "uniforme_absoluto":
+            X_noise = self.erro_aleatorio_x*(torch.rand_like(self.X_measured_mc)*2 - 1)
+        elif self.dist_erro_x == "normal_absoluto":
+            X_noise = self.erro_aleatorio_x*torch.randn_like(self.X_measured_mc)
         else:
             raise ValueError("dist_erro_x deve ser 'uniforme' ou 'normal'")
         
@@ -78,6 +89,10 @@ class Dataset:
             y_noise = self.y_measured_mc*self.erro_aleatorio_y*(torch.rand_like(self.y_measured_mc)*2 - 1)
         elif self.dist_erro_y == "normal":
             y_noise = self.y_measured_mc*self.erro_aleatorio_y*torch.randn_like(self.y_measured_mc)
+        elif self.dist_erro_y == "uniforme_absoluto":
+            y_noise = self.erro_aleatorio_y*(torch.rand_like(self.y_measured_mc)*2 - 1)
+        elif self.dist_erro_y == "normal_absoluto":
+            y_noise = self.erro_aleatorio_y*torch.randn_like(self.y_measured_mc)
         else:
             raise ValueError("dist_erro_y deve ser 'uniforme' ou 'normal'")
 
@@ -216,7 +231,10 @@ class UncertaintyEvaluator:
             print(f'-'*50)
         
         for name, y_pred in self.y_pred.items():
-            self.coverage[name], self.avg_width[name] = self.uncertainty_metrics(self.lower_quantiles[name], self.upper_quantiles[name], self.test_dataset.y_true)
+            self.coverage[name], self.avg_width[name] = self.uncertainty_metrics(self.test_dataset.X_measured, 
+                                                                                 self.lower_quantiles[name], 
+                                                                                 self.upper_quantiles[name], 
+                                                                                 self.test_dataset.y_true)
             if self.verbose:
                 print(f"{name.ljust(12)}|{100*self.coverage[name]:13.4f}%|{self.avg_width[name]:14.4f}")
 
@@ -248,10 +266,14 @@ class UncertaintyEvaluator:
         # Ruido multiplicativo
         if distribuicao == "uniforme":
             eps = np.random.uniform(-1.0, 1.0, size=X_mc.shape).astype(np.float32)
-        elif distribuicao == "gaussiano":
+        elif distribuicao == "normal":
+            eps = np.random.normal(0.0, 1.0, size=X_mc.shape).astype(np.float32)
+        elif distribuicao == "uniforme_absoluto":
+            eps = np.random.uniform(-1.0, 1.0, size=X_mc.shape).astype(np.float32)
+        elif distribuicao == "normal_absoluto":
             eps = np.random.normal(0.0, 1.0, size=X_mc.shape).astype(np.float32)
         else:
-            raise ValueError("distribuicao deve ser 'uniforme' ou 'gaussiano'.")
+            raise ValueError("distribuicao deve ser 'uniforme' ou 'normal'.")
 
         X_mc = X_mc + X_mc * erro_aleatorio * eps #- X_mc*erro_sistematico
 
@@ -273,17 +295,19 @@ class UncertaintyEvaluator:
     ##########      Gráficos de incerteza e métricas      ###########
     #################################################################        
 
-    def uncertainty_metrics(self, lower, upper, y_calc):
+    def uncertainty_metrics(self, X, lower, upper, y_calc):
+        mask = (X > self.test_dataset.val_min) & (X < self.test_dataset.val_max)
         # Cobertura efetiva: fração de y_calc dentro da banda
-        y_calc_np = y_calc.numpy().flatten()
-        coverage = np.mean((y_calc_np >= lower) & (y_calc_np <= upper))
+        y_calc_np = y_calc.numpy()
+        y_calc_np = y_calc_np[mask]
+        coverage = np.mean((y_calc_np >= lower[mask]) & (y_calc_np <= upper[mask]))
 
         # Largura média da banda
-        avg_width = np.mean(upper - lower)
+        avg_width = np.mean(upper[mask] - lower[mask])
 
         return coverage, avg_width
     
-    def graph_with_uncertainty(self, model_name, fig=None):
+    def graph_with_uncertainty(self, model_name, fig=None, plot_true=True, plot_measured=True):
         
         # Ordenar por X para o gráfico ficar correto
         sort_idx = np.argsort(self.test_dataset.X_measured.numpy().flatten())
@@ -292,6 +316,7 @@ class UncertaintyEvaluator:
         lower_sorted = self.lower_quantiles[model_name][sort_idx]
         upper_sorted = self.upper_quantiles[model_name][sort_idx]
         y_true_sorted = self.test_dataset.y_true.numpy().flatten()[sort_idx]
+        y_measured_sorted = self.test_dataset.y_measured.numpy().flatten()[sort_idx]
 
         if fig is None:
             fig = go.Figure()
@@ -315,14 +340,22 @@ class UncertaintyEvaluator:
             line=dict(color='blue')
         ))
 
-        # Valor calculado de teste
-        fig.add_trace(go.Scatter(
-            x=x_sorted,
-            y=y_true_sorted,
-            mode='markers',
-            name='Referência (Calculado)',
+        if plot_true:
+            fig.add_trace(go.Scatter(
+                x=x_sorted,
+                y=y_true_sorted,
+                mode='markers',
+                name='Valor Verdadeiro',
             marker=dict(color='red', size=5, opacity=0.7)
-        ))
+            ))
+        if plot_measured:
+            fig.add_trace(go.Scatter(
+                x=x_sorted,
+                y=y_measured_sorted,
+                mode='markers',
+                name='Medição',
+            marker=dict(color='black', size=5, opacity=0.7)
+            ))
 
         fig.add_vline(x=self.test_dataset.val_min,
                     line_dash="dash", line_color="green",
@@ -369,7 +402,8 @@ class ModelUncertaintyEvaluator(UncertaintyEvaluator):
             print(f'-'*50)
 
         for name, y_pred in self.y_pred.items():
-            self.coverage[name], self.avg_width[name] = self.uncertainty_metrics(self.lower_quantiles[name], 
+            self.coverage[name], self.avg_width[name] = self.uncertainty_metrics(self.test_dataset.X_measured, 
+                                                                                 self.lower_quantiles[name], 
                                                                                  self.upper_quantiles[name], 
                                                                                  self.test_dataset.y_true)
             if self.verbose:
