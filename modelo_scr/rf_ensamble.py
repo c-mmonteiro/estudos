@@ -7,9 +7,18 @@ class RFEnsambleModel:
                                            random_state=42, 
                                            max_samples=num_amostras_treino, 
                                            verbose=True)
-        
-        self.model.fit(X_train.reshape(-1, 1).numpy(), 
-                       y_train.numpy())
+
+        if isinstance(X_train, np.ndarray):
+            X_train_np = X_train.reshape(-1, 1)
+        else:
+            X_train_np = X_train.reshape(-1, 1).numpy()
+
+        if isinstance(y_train, np.ndarray):
+            y_train_np = y_train
+        else:
+            y_train_np = y_train.numpy()
+
+        self.model.fit(X_train_np, y_train_np)
         self.n_models_ensemble = n_models_ensemble
 
     def predict(self, X):
