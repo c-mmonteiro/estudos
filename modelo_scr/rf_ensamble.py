@@ -18,6 +18,12 @@ class RFEnsambleModel:
         else:
             y_train_np = y_train.numpy()
 
+        if X_train_np.ndim == 1:
+            X_train_np = X_train_np.reshape(-1, 1)
+
+        if y_train_np.ndim == 1:
+            y_train_np = y_train_np.reshape(-1, 1)
+
         self.model.fit(X_train_np, y_train_np)
         self.n_models_ensemble = n_models_ensemble
 
