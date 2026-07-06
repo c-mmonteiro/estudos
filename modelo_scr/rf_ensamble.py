@@ -5,7 +5,8 @@ class RFEnsambleModel:
     def __init__(self, X_train, y_train, n_models_ensemble=100, num_amostras_treino=None):
         self.model = RandomForestRegressor(n_estimators=n_models_ensemble, 
                                            random_state=42, 
-                                           max_samples=num_amostras_treino, 
+                                           max_samples=num_amostras_treino,
+                                           n_jobs=-1,
                                            verbose=True)
 
         if isinstance(X_train, np.ndarray):

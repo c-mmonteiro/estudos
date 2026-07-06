@@ -328,7 +328,7 @@ class NNEnsambleModel:
 
         q_np = self._to_numpy(q_values)
         q_shape = q_np.shape
-        q_values = self.y_scaler.scale_[0] * q_np.reshape(-1, 1)
+        q_values = self.y_scaler.inverse_transform(q_np).reshape(-1, 1)
         q_values = q_values.reshape(q_shape)
 
 
