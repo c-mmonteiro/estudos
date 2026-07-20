@@ -77,6 +77,7 @@ class Dataset:
             raise ValueError("dist_erro_x deve ser 'uniforme' ou 'normal'")
         
         self.X_measured_mc = self.X_measured_mc + X_noise
+        self.y_calc_mc = self.modelo_math(self.X_measured_mc)
 
         print(f'Shape X_measured_mc: {tuple(self.X_measured_mc.shape)}')
 

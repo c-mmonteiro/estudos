@@ -190,7 +190,11 @@ class InferenceEnsemble:
             for trainer in self.trainers
         ])
 
-        return preds.mean(dim=0), preds.std(dim=0)
+        if len(self.trainers) == 1:
+            return preds.mean(dim=0), None
+
+        else:
+            return preds.mean(dim=0), preds.std(dim=0)
     
     def predict_quantiles(self, x, quantiles=[0.05, 0.95]):
         if x.dim() == 1:
@@ -294,9 +298,11 @@ class NNEnsambleModel:
         y_pred_np = self._to_numpy(y_pred).reshape(-1, 1)
         y_pred_np = self.y_scaler.inverse_transform(y_pred_np).reshape(-1)
 
-        std_pred_np = self._to_numpy(std_pred).reshape(-1, 1)
-        std_pred_np = std_pred_np * self.y_scaler.scale_[0]  # Ajusta a incerteza para a escala original do y
-
+        if std_pred is not None:
+            std_pred_np = self._to_numpy(std_pred).reshape(-1, 1)
+            std_pred_np = std_pred_np * self.y_scaler.scale_[0]  # Ajusta a incerteza para a escala original do y
+        else:
+            std_pred_np = None
         if self.verbose:
             print(f"Inferência em {time.time() - start:.4f}s")
 
