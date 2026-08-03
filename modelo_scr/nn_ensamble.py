@@ -42,6 +42,36 @@ class TrainerConfig:
             device=torch.device(d["device"])
         )
 
+#########################################################
+#####       Classe Residual (Skip Connection)      #####
+#########################################################
+class ResidualBlock(nn.Module):
+    def __init__(self, in_dim, out_dim, activation, dropout=0.0):
+        super().__init__()
+
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+
+        self.linear = nn.Linear(in_dim, out_dim)
+        self.activation = activation
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+        # Projeção da conexão residual, caso as dimensões sejam diferentes
+        if in_dim == out_dim:
+            self.shortcut = nn.Identity()
+
+    def forward(self, x):
+        if self.in_dim == self.out_dim:
+            residual = self.shortcut(x)
+
+        out = self.linear(x)
+        out = self.activation(out)
+        out = self.dropout(out)
+
+        if self.in_dim == self.out_dim:
+            return out + residual
+        else:
+            return out
 
 # =========================
 # MLP
@@ -114,6 +144,8 @@ class TorchTrainer:
         self.optimizer = self._build_optimizer()
         self.loss_fn = self._build_loss()
 
+        self.total_epochs = 0
+
     def _build_optimizer(self):
         if self.config.optimizer == "adam":
             return torch.optim.Adam(self.model.parameters(), lr=self.config.lr)
@@ -130,17 +162,24 @@ class TorchTrainer:
         else:
             raise ValueError("Unknown loss")
 
-    def fit(self, X, y):
+    def fit(self, X, y, epochs=None):
         y = y.view(-1, 1)
 
         self.model.train()
 
-        for _ in range(self.config.epochs):
+        if epochs is None:
+            n_epochs = self.config.epochs
+        else:
+            n_epochs = epochs
+
+        for _ in range(n_epochs):
             self.optimizer.zero_grad()
             preds = self.model(X)
             loss = self.loss_fn(preds, y)
             loss.backward()
             self.optimizer.step()
+
+        self.total_epochs += n_epochs
 
     def predict(self, X_tensor):
         self.model.eval()
@@ -150,12 +189,14 @@ class TorchTrainer:
     def get_state(self):
         return {
             "model_state": self.model.state_dict(),
-            "optimizer_state": self.optimizer.state_dict()
+            "optimizer_state": self.optimizer.state_dict(),
+            "total_epochs": self.total_epochs
         }
 
     def load_state(self, state):
         self.model.load_state_dict(state["model_state"])
         self.optimizer.load_state_dict(state["optimizer_state"])
+        self.total_epochs = state.get("total_epochs", 0)
 
 
 # =========================
@@ -165,21 +206,29 @@ class InferenceEnsemble:
     def __init__(self, n_models, model_fn, trainer_config):
         self.device = trainer_config.device
         self.trainers = []
+        self.model_idx_data = []
 
         for _ in range(n_models):
             model = model_fn()
             trainer = TorchTrainer(model, trainer_config)
             self.trainers.append(trainer)
 
-    def fit(self, X, y, ds_size=None):
+    def fit(self, X, y, ds_size=None, bootstrap=True, epochs=None, verbose=False):
         N = X.shape[0]
 
-        if ds_size is None:
-            ds_size = N
+        if len(self.model_idx_data) == 0:
+            if ds_size is None:
+                ds_size = N
 
-        for trainer in tqdm.tqdm(self.trainers):
-            idx = torch.randint(0, N, (ds_size,), device=self.device)
-            trainer.fit(X[idx], y[idx])
+            for _ in range(len(self.trainers)):
+                self.model_idx_data.append(torch.randint(0, N, (ds_size,), device=self.device))
+
+        for idx, trainer in tqdm.tqdm(enumerate(self.trainers), disable=not verbose):
+            if bootstrap:
+                idx_data = self.model_idx_data[idx]
+                trainer.fit(X[idx_data], y[idx_data], epochs=epochs)
+            else:
+                trainer.fit(X, y, epochs=epochs)
 
     def predict(self, x):
         if x.dim() == 1:
@@ -188,7 +237,7 @@ class InferenceEnsemble:
         preds = torch.stack([
             trainer.predict(x).squeeze(-1)
             for trainer in self.trainers
-        ])
+        ])       
 
         if len(self.trainers) == 1:
             return preds.mean(dim=0), None
@@ -222,11 +271,15 @@ class InferenceEnsemble:
         return preds
 
     def get_state(self):
-        return [trainer.get_state() for trainer in self.trainers]
+        return {
+            "trainers":[trainer.get_state() for trainer in self.trainers],
+            "bootstrap_indices": self.model_idx_data
+        }
 
     def load_state(self, states):
-        for trainer, state in zip(self.trainers, states):
+        for trainer, state in zip(self.trainers, states["trainers"]):
             trainer.load_state(state)
+        self.model_idx_data = states.get("bootstrap_indices", [])
 
 
 # =========================
@@ -247,6 +300,7 @@ class NNEnsambleModel:
 
         self.x_scaler = MinMaxScaler()
         self.y_scaler = MinMaxScaler()
+        self.scalers_fitted = False
         self.verbose = verbose
 
         self.n_models_ensemble = n_models
@@ -261,15 +315,22 @@ class NNEnsambleModel:
             return x.detach().cpu().numpy()
         return x
 
-    def fit(self, X, y, ds_size=None):
+    def fit(self, X, y, ds_size=None, bootstrap=True, epochs=None):
         X_np = self._to_numpy(X)
         y_np = self._to_numpy(y)
 
-        if y_np.ndim == 1:
-            y_np = y_np.reshape(-1, 1)
+        if X_np.ndim == 1:
+            X_np = X_np.reshape(-1, 1)
 
-        X_scaled = self.x_scaler.fit_transform(X_np)
-        y_scaled = self.y_scaler.fit_transform(y_np).reshape(-1)
+        y_np = y_np.reshape(-1, 1)
+
+        if not self.scalers_fitted:
+            X_scaled = self.x_scaler.fit_transform(X_np)
+            y_scaled = self.y_scaler.fit_transform(y_np).reshape(-1)
+            self.scalers_fitted = True
+        else:
+            X_scaled = self.x_scaler.transform(X_np)
+            y_scaled = self.y_scaler.transform(y_np).reshape(-1)
 
         X = self._to_tensor(X_scaled)
         y = self._to_tensor(y_scaled)
@@ -279,15 +340,18 @@ class NNEnsambleModel:
         if self.verbose:
             print("Treinando ensemble de inferência do valor...")
 
-        self.inf_ens.fit(X, y, ds_size=ds_size)
+        self.inf_ens.fit(X, y, ds_size=ds_size, 
+                         bootstrap=bootstrap, 
+                         epochs=epochs, verbose=self.verbose)
 
         if self.verbose:
             print(f"Treinamento concluído em {time.time() - start:.2f}s")
 
     def predict(self, x, return_std=True, in_tensor=False):
-        x = self._to_tensor(x)
-
         x_np = self._to_numpy(x)
+        if x_np.ndim == 1:
+            x_np = x_np.reshape(-1, 1)
+
         x = self._to_tensor(self.x_scaler.transform(x_np))
 
         start = time.time()
@@ -319,6 +383,9 @@ class NNEnsambleModel:
 
     def predict_quantiles(self, x, alpha=0.05):
         x_np = self._to_numpy(x)
+        if x_np.ndim == 1:
+            x_np = x_np.reshape(-1, 1)
+            
         x = self._to_tensor(self.x_scaler.transform(x_np))
 
         quantiles=[alpha/2, 1 - alpha/2]
@@ -345,6 +412,8 @@ class NNEnsambleModel:
 
     def predict_sample(self, x):
         x_np = self._to_numpy(x)
+        if x_np.ndim == 1:
+            x_np = x_np.reshape(-1, 1)
         x = self._to_tensor(self.x_scaler.transform(x_np))
 
         start = time.time()
