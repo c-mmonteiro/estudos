@@ -83,7 +83,8 @@ class MLP(nn.Module):
         hidden_layers=[45],
         activation="tanh",
         output_activation=None,
-        dropout=0.0
+        dropout=0.0,
+        skip_connections=False
     ):
         super().__init__()
 
@@ -93,6 +94,7 @@ class MLP(nn.Module):
             "hidden_layers": hidden_layers,
             "activation": activation,
             "output_activation": output_activation,
+            "skip_connections": skip_connections,
             "dropout": dropout
         }
 
@@ -101,11 +103,14 @@ class MLP(nn.Module):
         act_fn = self._get_activation(activation)
 
         for h in hidden_layers:
-            layers.append(nn.Linear(prev_dim, h))
-            layers.append(act_fn)
+            if skip_connections:
+                layers.append(ResidualBlock(prev_dim, h, act_fn, dropout))
+            else:
+                layers.append(nn.Linear(prev_dim, h))
+                layers.append(act_fn)
 
-            if dropout > 0:
-                layers.append(nn.Dropout(dropout))
+                if dropout > 0:
+                    layers.append(nn.Dropout(dropout))
 
             prev_dim = h
 
